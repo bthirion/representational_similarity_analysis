@@ -1,0 +1,205 @@
+"""
+This script creates ROIs in the Haxby dataset through the Harvard-Oxford atlas
+then runs ROI-specific analyses of the data using least squares and RSA.
+ 
+"""
+
+from matplotlib import pyplot as plt
+
+### Load Haxby dataset ########################################################
+import numpy as np
+from nilearn import datasets, input_data, image
+from nilearn import plotting
+from nibabel import load, save
+
+from sklearn.svm import SVC
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.multiclass import OneVsOneClassifier, OneVsRestClassifier
+# from sklearn.pipeline import Pipeline
+from sklearn import linear_model
+from sklearn import preprocessing
+
+from sklearn.cross_validation import cross_val_score
+from ni_rrr import fit_predict
+from scipy.stats import spearmanr
+from scipy import stats, linalg
+from joblib import Parallel, delayed
+
+haxby_dataset = datasets.fetch_haxby_simple()
+func_filename = haxby_dataset.func
+mask_filename = haxby_dataset.mask
+
+atlas_filename, labels = datasets.fetch_harvard_oxford(
+    'cort-maxprob-thr25-2mm', symmetric_split=True)
+
+
+affine = load(mask_filename).get_affine()
+shape = load(mask_filename).get_shape()
+atlas = image.resample_img(atlas_filename, target_affine=affine,
+                           target_shape=shape, interpolation='nearest')
+roi_masker = input_data.NiftiLabelsMasker(labels_img=atlas,
+                                          mask_img=mask_filename)
+roi_masker.fit(mask_filename) ## just to have it fitted
+
+
+y, session = np.loadtxt(haxby_dataset.session_target).astype('int').T
+conditions = np.recfromtxt(haxby_dataset.conditions_target)['f0']
+
+# Remove the rest condition, it is not very interesting
+non_rest = conditions != b'rest'
+conditions = conditions[non_rest]
+y = y[non_rest]
+
+# Get the labels of the numerical conditions represented by the vector y
+unique_conditions, order = np.unique(conditions, return_index=True)
+# Sort the conditions by the order of appearance
+unique_conditions = unique_conditions[np.argsort(order)]
+
+### Loading step ##############################################################
+# For decoding, standardizing is often very important
+nifti_masker = input_data.NiftiMasker(
+    mask_img=mask_filename, standardize=True, detrend=True,
+    sessions=session, smoothing_fwhm=None,
+    memory="nilearn_cache", memory_level=1)
+X = nifti_masker.fit_transform(func_filename)
+X = X[non_rest]
+session = session[non_rest]
+
+# region-level analysis
+n_perm = 10000
+mask = nifti_masker.mask_img_.get_data()
+atlas_labels = atlas.get_data()[mask > 0]
+
+### Statistical scores ###################################################
+
+def permute_labels_across_sessions(y, session):
+    """ generates a permutatiation of labels across sessions"""
+    y_ = y.copy()
+    for session_ in session:
+        mask_ = session == session_
+        perm_ = np.random.permutation(np.unique(y[mask_]))
+        y_[mask_] = perm_[y[mask_] - 1] + 1  # un bit unclean, sorry
+    return y_
+
+
+def labels_to_dmtx(y):
+    """ Create a (occurrence) design matrix out of the vector of labels"""
+    n, q = len(y), len(np.unique(y))
+    z = y.copy()
+    for w, v in enumerate(np.unique(y)):
+        z[y == v] = w
+    Y = np.zeros((n, q))
+    Y[np.arange(n), z] = 1
+    return Y
+
+def analysis(X, y, k, session, do_classif=False, do_rsa=False, do_lm=False,
+             do_rrr=False):
+    if k == 0:
+        return 0
+    x = X[:, atlas_labels == k]
+    if do_classif:
+        cv_scores = cross_val_score(
+            SVC(kernel='linear'), x, y, cv=5, n_jobs=2,
+            verbose=1)
+        print k, x.shape, cv_scores.mean()
+        roi_score = cv_scores.mean()
+
+    elif do_rsa:
+        stim_similarity = (y[np.newaxis, :] == y[:, np.newaxis]).astype(
+            np.float)
+        voxels_similarity = np.corrcoef(x)
+        # extract lower triangular part of symmetric
+        lw_idx = np.triu_indices(n_samples, k=1)
+        stim_vsim = stim_similarity[lw_idx]
+        voxels_vsim = voxels_similarity[lw_idx]
+        # compute the statistic
+        # T = np.corrcoef(stim_vsim, voxels_vsim)[0, 1]
+        T = spearmanr(stim_vsim, voxels_vsim)[0]
+
+        T_perm = np.zeros(n_perm)
+        for i in range(n_perm):
+            # permute the labels
+            y_ = permute_labels_across_sessions(y, session)
+            # compute the test statistic
+            stim_vsim_perm = (
+                y_[np.newaxis, :] == y_[:, np.newaxis]).\
+                astype(np.float)[lw_idx]
+            # T_perm[i] = np.corrcoef(voxels_vsim, stim_vsim_perm)[0, 1]
+            T_perm[i] = spearmanr(stim_vsim_perm, voxels_vsim)[0]
+
+        roi_score = np.sum(T_perm <= T) * 1. / n_perm   # 1 - p_value
+        print k, x.shape, T, roi_score
+    elif do_lm:
+        clf = linear_model.LinearRegression()
+        Y = labels_to_dmtx(y)
+        pred = clf.fit(Y, x).predict(Y)
+        T = linalg.norm(pred - x, 'fro')
+        T_perm = np.zeros(n_perm)
+        for i in range(n_perm):
+            # permute the labels
+            y_ = permute_labels_across_sessions(y, session)
+            Y_ = labels_to_dmtx(y_)
+            pred_perm = clf.fit(Y_, x).predict(Y_)
+            # compute the test statistic
+            T_perm[i] = linalg.norm(pred_perm - x, 'fro')
+
+        roi_score = np.sum(T_perm >= T) * 1. / n_perm   # 1 - p_value
+        print k, x.shape, T, roi_score
+    elif do_rrr:
+        rank = 1
+        Y = labels_to_dmtx(y)
+        _, residuals = fit_predict(Y, x, rank=rank)
+        T = linalg.norm(residuals, 'fro')
+        T_perm = np.zeros(n_perm)
+        for i in range(n_perm):
+            # permute the labels
+            y_ = permute_labels_across_sessions(y, session)
+            Y_ = labels_to_dmtx(y_)
+            _, residuals = fit_predict(Y_, x, rank=rank)
+            T_perm[i] = linalg.norm(residuals, 'fro')
+
+        roi_score = np.sum(T_perm >= T) * 1. / n_perm   # 1 - p_value
+        print k, x.shape, T, roi_score
+    return roi_score
+
+for batch in [0]:
+    session_mask = np.logical_and(batch * 4 <= session,
+                                  session < 4 * (batch + 1))
+
+    X, y, session_ = X[session_mask], y[session_mask], session[session_mask]  
+    n_samples = len(y)
+
+    # remove the session effect
+    Z = labels_to_dmtx(session_)
+    X = X - np.dot(Z, np.dot(linalg.pinv(Z), X))
+    X = preprocessing.StandardScaler().fit_transform(X)
+
+    """
+    do_rsa = True
+    roi_scores = Parallel(n_jobs=12)(delayed(analysis)(X, y, k, session_,
+                                                       do_rsa=do_rsa)
+                    for k in np.unique(atlas_labels))
+    roi_scores = np.array(roi_scores)
+    np.savez('roi_scores_rsa_%d_.npz' % batch , roi_scores)
+    
+    do_lm = True
+    roi_scores = Parallel(n_jobs=12)(delayed(analysis)(X, y, k, session_,
+                                                       do_lm=do_lm)
+                    for k in np.unique(atlas_labels))
+    roi_scores = np.array(roi_scores)
+    np.savez('roi_scores_lm_%d_.npz' % batch, roi_scores)
+    
+    do_rrr = True
+    roi_scores = Parallel(n_jobs=12)(delayed(analysis)(X, y, k, session_,
+                                                       do_rrr=do_rrr)
+                    for k in np.unique(atlas_labels))
+    roi_scores = np.array(roi_scores)
+    np.savez('roi_scores_rrr_%d_.npz' % batch, roi_scores)
+   
+    do_classif = True
+    roi_scores = Parallel(n_jobs=2)(delayed(analysis)(X, y, k, session_,
+                                                      do_classif=do_classif)
+                    for k in np.unique(atlas_labels))
+    roi_scores = np.array(roi_scores)
+    np.savez('roi_scores_classif_%d_.npz' % batch, roi_scores)
+    """
