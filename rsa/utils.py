@@ -35,7 +35,7 @@ def load_data(n_samples, n_voxels, activation=0, n_features=1,
     # simulate the noise
     noise = np.random.randn(n_samples, n_voxels)
     if heteroscedastic:
-        noise[n_samples / 2:] *= 2
+        noise[n_samples / 2:] *= np.sqrt(2)
         # noise[:n_voxels / 2] *= 2
 
     if random_effects:

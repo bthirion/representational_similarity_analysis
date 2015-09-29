@@ -20,7 +20,7 @@ from sklearn import preprocessing, linear_model
 from utils import load_data, square_pdist
 
 do_save = False
-n_iter = 100
+n_iter = 1000
 # perform a permutation test and return the p-value.
 # This will be repeated n_iter times to find the distributed of p-values.
 # the seed is given as argument to make sure that
