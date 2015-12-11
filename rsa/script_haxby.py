@@ -24,7 +24,7 @@ from sklearn import linear_model
 from sklearn import preprocessing
 
 from sklearn.cross_validation import cross_val_score
-from ni_rrr import fit_predict
+# from ni_rrr import fit_predict
 from scipy.stats import spearmanr
 from scipy import stats, linalg
 from joblib import Parallel, delayed
@@ -45,6 +45,9 @@ roi_masker = input_data.NiftiLabelsMasker(labels_img=atlas,
                                           mask_img=mask_filename)
 roi_masker.fit(mask_filename) ## just to have it fitted
 
+labels = np.recfromcsv(haxby_dataset.session_target[0], delimiter=" ")
+target = labels['labels']
+###################################################
 
 y, session = np.loadtxt(haxby_dataset.session_target).astype('int').T
 conditions = np.recfromtxt(haxby_dataset.conditions_target)['f0']
